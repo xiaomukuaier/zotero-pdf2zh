@@ -34,6 +34,7 @@ class TaskManager:
         self.active_tasks = {}
         self.lock = threading.Lock()
         self.progress_history = []
+        self.registry = None
 
     @staticmethod
     def _task_snapshot(task_id, task):
@@ -57,6 +58,11 @@ class TaskManager:
     def update_task(self, task_id, updates):
         with self.lock:
             if task_id in self.active_tasks:
+                if self.active_tasks[task_id].get('finished'):
+                    return
+                updates = dict(updates)
+                if 'progress' in updates:
+                    updates['progress'] = max(0, min(99, updates['progress']))
                 self.active_tasks[task_id].update(updates)
                 # _debug_progress_log(
                 #     "TASK_UPDATE",
@@ -73,6 +79,11 @@ class TaskManager:
             # returning HTTP; do not overwrite a completed success as failure.
             if task.get("active") is False and task.get("status") == "完成":
                 return
+            if self.registry:
+                if status == 'success':
+                    self.registry.complete(task_id, result or {'status': 'success', 'filePaths': file_paths, 'fileList': file_list, 'outputDir': output_dir})
+                else:
+                    self.registry.fail(task_id)
             task["active"] = False
             task["finished"] = True
             task["status"] = "完成" if status == "success" else "失败"

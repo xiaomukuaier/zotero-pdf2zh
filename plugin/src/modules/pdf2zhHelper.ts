@@ -13,8 +13,10 @@ import {
     JobProgressUpdate,
 } from "./pdf2zhTypes";
 import { loadLLMApisFromPrefs } from "./preferenceScript";
+import { isTrackedResult, ResultImports } from "./pdf2zhResultImports";
 
 export class PDF2zhHelperFactory {
+    private static readonly resultImports = new ResultImports();
     // 翻译请求本身不要重试，避免同一篇 PDF 被重复翻译。
     private static readonly MAX_RETRIES = 1;
     private static readonly RETRY_DELAY = 2000; // 2秒
@@ -601,6 +603,41 @@ export class PDF2zhHelperFactory {
         item: Zotero.Item,
         config: ServerConfig,
     ) {
+        const key = JSON.stringify([
+            item.libraryID,
+            this.getParentItemID(item) ?? "top-level",
+            response.fileList,
+        ]);
+        await this.resultImports.run(key, () =>
+            this.attachResponse(response, item, config),
+        );
+    }
+
+    static async hasImportedResult(item: Zotero.Item, fileName: string) {
+        if (!isTrackedResult(fileName)) return false;
+        const parentID = this.getParentItemID(item);
+        const candidates = parentID
+            ? Zotero.Items.get(Zotero.Items.get(parentID).getAttachments())
+            : await Zotero.Items.getAll(item.libraryID, true);
+        const leafName = this.safeStorageLeafName(fileName);
+        for (const attachment of candidates) {
+            if (
+                !attachment.deleted &&
+                attachment.isAttachment() &&
+                attachment.attachmentFilename === leafName &&
+                (await attachment.getFilePathAsync())
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static async attachResponse(
+        response: any,
+        item: Zotero.Item,
+        config: ServerConfig,
+    ) {
         ztoolkit.log("response", response);
         if (response.status === "accepted") {
             throw new Error("任务仍在处理中，尚未完成");
@@ -624,6 +661,10 @@ export class PDF2zhHelperFactory {
         const attachKeys = new Set<string>();
         for (let i = 0; i < fileList.length; i++) {
             const fileName = fileList[i];
+            if (await this.hasImportedResult(item, fileName)) {
+                attached++;
+                continue;
+            }
             const fileType = this.getFileType(fileName);
             const options = this.getPDFOptions(fileType);
             try {

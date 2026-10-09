@@ -282,6 +282,8 @@ python server.py --env_tool=conda
 
 服务启动后，可在浏览器中访问 `http://127.0.0.1:8890` 查看翻译进度和使用相关功能：
 
+Python 安装的 PDF2zh Next 使用引擎提供的总体进度，输出文件校验完成后显示 100%。重复提交相同 PDF 和配置时，Server 复用运行中的任务或已完成的有效结果。请同时更新插件，以便复用已经导入的结果附件。实现及验证方式见[翻译进度与重复请求](server/doc/task-processing.md)。
+
 <div align="center">
   <img src="./images/html1.png" width="400"/><br>
   <small>查看当前配置信息</small>

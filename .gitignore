@@ -13,6 +13,8 @@ server/config/config.json
 server/config/config.toml
 server/config/venv.json
 server/config/package_update_state.json
+server/config/jobs.sqlite3*
+server/**/.test-*/
 server/config/*.invalid.bak
 server/config/*.invalid.*.bak
 

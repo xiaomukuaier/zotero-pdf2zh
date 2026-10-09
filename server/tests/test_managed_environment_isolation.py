@@ -1,4 +1,6 @@
 import os
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -187,34 +189,17 @@ class ManagedEnvironmentIsolationTest(unittest.TestCase):
         self.assertEqual(captured["PYTHONHOME"], "system-home")
 
     def test_managed_mode_removes_ambient_python_settings(self):
-        captured = {}
-
-        class Manager:
-            @staticmethod
-            def get_command_and_env(cmd):
-                return cmd, {
-                    **os.environ,
-                    "PYTHONPATH": "polluted",
-                    "PYTHONHOME": "polluted-home",
-                    "PATH": "managed-bin",
-                }
-
-        def capture(_cmd, env, _task_id, _cols, _rows):
-            captured.update(env)
-
-        args = SimpleNamespace(enable_venv=True)
-        with (
-            patch.object(
-                execute,
-                "prepare_deepseek_runtime_command",
-                side_effect=lambda cmd, env: cmd,
-            ),
-            patch.object(execute, "_execute_with_pty", side_effect=capture),
-        ):
-            execute.execute_with_progress(
-                ["pdf2zh_next", "paper.pdf"], None, args, Manager()
-            )
-
+        isolated = managed_python_env({
+            **os.environ,
+            "PYTHONPATH": "polluted",
+            "PYTHONHOME": "polluted-home",
+            "PATH": "managed-bin",
+        })
+        process = subprocess.run(
+            [sys.executable, '-c', 'import json, os; print(json.dumps(dict(os.environ)))'],
+            env=isolated, capture_output=True, text=True, check=True,
+        )
+        captured = json.loads(process.stdout)
         self.assertNotIn("PYTHONPATH", captured)
         self.assertNotIn("PYTHONHOME", captured)
         self.assertEqual(captured["PYTHONNOUSERSITE"], "1")

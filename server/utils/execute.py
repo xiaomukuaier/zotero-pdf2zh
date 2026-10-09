@@ -4,11 +4,15 @@ import select
 import subprocess
 import sys
 import threading
+import json
+import shutil
+from pathlib import Path
 from datetime import datetime
 
 from utils.deepseek_thinking import prepare_deepseek_runtime_command
 from utils.environment_lifecycle import managed_python_env
 from utils.task_manager import task_manager
+from utils.structured_progress import PREFIX, progress_update
 
 # Match lines like: "translate ... 10/100"
 # MAIN_PROGRESS_RE = re.compile(r"\btranslate\b[^\r\n]*?(\d+)/(\d+)\b", re.IGNORECASE)
@@ -23,9 +27,6 @@ MAIN_PROGRESS_RE = re.compile(
 
 # Match step-like lines where only status message should be updated
 STEP_PROGRESS_RE = re.compile(r"(.+?)\(\d+/\d+\)\s+.*?(\d+)/(\d+)")
-
-# Legacy pdf2zh (1.x) progress format
-LEGACY_PROGRESS_RE = re.compile(r"(?:translate|Running|Parse).*?(\d+)/(\d+)", re.IGNORECASE)
 
 # Strip ANSI sequences before regex matching
 ANSI_ESCAPE = re.compile(r"(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]")
@@ -196,10 +197,41 @@ def execute_with_progress(cmd, task_id, args, env_manager):
 
     print(f"[execute_with_progress] {' '.join(final_cmd)}\n")
 
+    if cmd[0] == 'pdf2zh_next':
+        runner = str(Path(__file__).with_name('next_runner.py'))
+        executable_index = next(i for i, part in enumerate(final_cmd) if Path(part).name in {'pdf2zh_next', 'pdf2zh_next.exe'})
+        executable = shutil.which(final_cmd[0], path=final_env.get('PATH'))
+        if executable is None:
+            raise FileNotFoundError(final_cmd[0])
+        if executable_index:
+            python = executable
+        else:
+            launcher_directory = Path(executable).parent
+            candidates = [launcher_directory / 'python', launcher_directory / 'python3']
+            if sys.platform == 'win32':
+                candidates = [launcher_directory / 'python.exe', launcher_directory.parent / 'python.exe']
+            python = str(next(path for path in candidates if path.is_file()))
+        structured_cmd = [python, runner, *final_cmd[executable_index + 1:]]
+        _execute_structured(structured_cmd, final_env, task_id)
+        return
+
     if sys.platform != "win32":
         _execute_with_pty(final_cmd, final_env, task_id, child_cols, child_rows)
     else:
         _execute_with_inherit(final_cmd, final_env, task_id, cols)
+
+def _execute_structured(command, env, task_id):
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', env=env) as process:
+        for line in process.stdout:
+            if line.startswith(PREFIX):
+                event = json.loads(line[len(PREFIX):])
+                task_manager.update_task(task_id, progress_update(event))
+            else:
+                print(line, end='', flush=True)
+        return_code = process.wait()
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, command)
+
 
 def _parse_progress(text, task_id):
     """Parse progress info from text and update task_manager."""
@@ -250,18 +282,6 @@ def _parse_progress(text, task_id):
                 "message": f"translate {curr}/{total}",
             })
 
-    # Legacy format
-    match = LEGACY_PROGRESS_RE.search(clean)
-    if match:
-        curr, total = int(match.group(1)), int(match.group(2))
-        if total > 0:
-            pct = int((curr / total) * 100)
-            task_manager.update_task(task_id, {
-                "progress": pct,
-                "status": "running",
-            })
-            # 【新增调试日志】记录 Legacy 正则是不是抓错了
-            # _debug_progress_log("MATCH_LEGACY", curr=curr, total=total, pct=pct)
 
 # def _parse_progress(text, task_id):
 #     """Parse progress info from text and update task_manager."""

@@ -2,7 +2,9 @@
 # guaguastandup
 # zotero-pdf2zh
 import os
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, send_file, Response, g, make_response
+from contextvars import ContextVar
+from functools import wraps
 from werkzeug.serving import WSGIRequestHandler
 import base64
 import subprocess
@@ -28,7 +30,6 @@ import io
 import socket  # 用于端口检查
 import time    # 用于 SSE 推送间隔
 import threading
-import uuid    # 用于生成任务唯一标识
 from datetime import datetime  # 用于记录任务开始/结束时间
 # 导入自动更新模块
 from utils.auto_update import check_for_updates, fetch_and_show_notices, perform_update_optimized
@@ -36,6 +37,7 @@ from utils.auto_update import check_for_updates, fetch_and_show_notices, perform
 from utils.task_manager import task_manager
 # 导入带进度解析的命令执行器
 from utils.execute import execute_with_progress
+from utils.job_registry import JobRegistry, request_fingerprint, file_digest
 
 _VALUE_ERROR_RE = re.compile(r'(?m)^ValueError:\s*(?P<msg>.+)$')
 
@@ -59,8 +61,11 @@ else:
 
 # 所有系统: 获取当前脚本server.py所在的路径
 root_path     = os.path.dirname(os.path.abspath(__file__))
-config_folder = os.path.join(root_path, 'config')
-output_folder = os.path.join(root_path, 'translated')
+data_path = os.path.abspath(os.environ.get('ZOTERO_PDF2ZH_DATA', root_path))
+config_folder = os.path.join(data_path, 'config')
+published_folder = os.path.join(data_path, 'translated')
+_job_output = ContextVar('job_output', default=published_folder)
+output_folder = published_folder
 config_path = { # 配置文件路径
     pdf2zh:      os.path.join(config_folder, 'config.json'),
     pdf2zh_next: os.path.join(config_folder, 'config.toml'),
@@ -103,16 +108,19 @@ class PDFTranslator:
         if args.enable_venv:
             self.env_manager = VirtualEnvManager(config_path[venv], venv_name, args.env_tool, args.enable_mirror, args.skip_install, args.mirror_source)
         self.cropper = Cropper()
+        self.jobs = JobRegistry(os.path.join(config_folder, 'jobs.sqlite3'))
+        self.jobs.recover_interrupted()
+        task_manager.registry = self.jobs
         self.setup_routes()
 
     def setup_routes(self):
         # 新增：首页路由 - 提供 index.html 前端进度监控页面
         self.app.add_url_rule('/', 'index', self.index)
 
-        self.app.add_url_rule('/translate', 'translate', self.translate, methods=['POST'])
+        self.app.add_url_rule('/translate', 'translate', self._deduplicate(self.translate), methods=['POST'])
         self.app.add_url_rule('/crop', 'crop', self.crop, methods=['POST'])
-        self.app.add_url_rule('/crop-compare', 'crop-compare', self.crop_compare, methods=['POST'])
-        self.app.add_url_rule('/compare', 'compare', self.compare, methods=['POST'])
+        self.app.add_url_rule('/crop-compare', 'crop-compare', self._deduplicate(self.crop_compare), methods=['POST'])
+        self.app.add_url_rule('/compare', 'compare', self._deduplicate(self.compare), methods=['POST'])
         self.app.add_url_rule(
             '/translatedFile/<path:filename>',
             'download',
@@ -251,7 +259,54 @@ class PDFTranslator:
             raise ValueError("Only PDF uploads are accepted")
         return name
 
+    def _deduplicate(self, handler):
+        @wraps(handler)
+        def dispatch():
+            data = request.get_json()
+            if not isinstance(data, dict):
+                return jsonify(status='error', message='Invalid JSON request'), 400
+            file_content = data.get('fileContent', '')
+            if not isinstance(file_content, str):
+                return jsonify(status='error', message='Invalid PDF content'), 400
+            content = base64.b64decode(file_content.removeprefix('data:application/pdf;base64,'), validate=True)
+            configuration = Config(data)
+            file_name = self._safe_upload_filename(data.get('fileName'))
+            identity = dict(vars(configuration), inputType=self.get_filetype(file_name))
+            template = config_path.get(configuration.engine)
+            if template and os.path.isfile(template):
+                identity['templateDigest'] = file_digest(template)
+            fingerprint = request_fingerprint(content, identity, request.path)
+            owner, job = self.jobs.claim(fingerprint)
+            if not owner:
+                if job['status'] == 'success':
+                    return jsonify(job['result'])
+                if self._client_wants_async_job():
+                    return jsonify(status='accepted', taskId=job['taskId'])
+                # 旧客户端仍然等待现有任务返回文件列表。
+                state = self.jobs.get(job['taskId'])
+                while state['status'] == 'running':
+                    time.sleep(0.25)
+                    state = self.jobs.get(job['taskId'])
+                if state['status'] == 'success':
+                    return jsonify(state['result'])
+                return jsonify(status='error', message='Shared translation job failed'), 500
+            g.translation_task_id = job['taskId']
+            directory = os.path.join(published_folder, '.jobs', job['taskId'])
+            token = _job_output.set(directory)
+            accepted = False
+            try:
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                response = make_response(handler())
+                accepted = response.status_code < 400
+                return response
+            finally:
+                _job_output.reset(token)
+                if not accepted:
+                    self.jobs.fail(job['taskId'])
+        return dispatch
+
     def process_request(self):
+        output_folder = _job_output.get()
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
             raise ValueError("Invalid JSON request")
@@ -289,11 +344,24 @@ class PDFTranslator:
         return existing
 
     def _success_files_payload(self, paths):
+        output_folder = _job_output.get()
         existing = self._existing_output_files(paths)
+        for path in existing:
+            if not PdfReader(path).pages:
+                raise ValueError('Generated PDF has no pages')
+        if os.path.abspath(output_folder) != os.path.abspath(published_folder):
+            published = []
+            for source in existing:
+                name = os.path.basename(source).encode('utf-8')[-218:].decode('utf-8', errors='ignore')
+                destination = os.path.join(published_folder, os.path.basename(output_folder) + '_' + name)
+                os.replace(source, destination)
+                published.append(destination)
+            existing = published
         return {
             'status': 'success',
+            'taskId': os.path.basename(output_folder) if str(output_folder) != published_folder else None,
             'fileList': [os.path.basename(p) for p in existing],
-            'outputDir': os.path.abspath(output_folder),
+            'outputDir': os.path.abspath(published_folder),
             'filePaths': existing,
         }
 
@@ -382,12 +450,16 @@ class PDFTranslator:
         # 旧插件：阻塞到完成，再返回 {status: success, fileList, ...}。
         task_manager.add_task(task_id, task_info)
         if self._client_wants_async_job():
+            job_directory = _job_output.get()
             def run():
+                token = _job_output.set(job_directory)
                 try:
                     worker()
                 except Exception as exc:
                     task_manager.complete_task(task_id, 'failed', str(exc), error=str(exc))
                     self._exception_payload(exc, context=context)
+                finally:
+                    _job_output.reset(token)
 
             threading.Thread(target=run, daemon=True).start()
             return jsonify({'status': 'accepted', 'taskId': task_id}), 200
@@ -493,7 +565,7 @@ class PDFTranslator:
     # 翻译 /translate
     def translate(self):
         # 生成任务ID并记录开始时间（用于 index.html 前端进度显示）
-        task_id = str(uuid.uuid4())
+        task_id = g.translation_task_id
         start_time = datetime.now()
 
         try:
@@ -761,7 +833,7 @@ class PDFTranslator:
             return self._handle_exception(e, context='/crop')
 
     def crop_compare(self):
-        task_id = str(uuid.uuid4())
+        task_id = g.translation_task_id
         start_time = datetime.now()
         try:
             input_path, config = self.process_request()
@@ -838,7 +910,7 @@ class PDFTranslator:
 
     # /compare
     def compare(self):
-        task_id = str(uuid.uuid4())
+        task_id = g.translation_task_id
         start_time = datetime.now()
         try:
             input_path, config = self.process_request()
@@ -1014,8 +1086,9 @@ class PDFTranslator:
         return inpath.replace(f'{intype}.pdf', f'{outtype}.pdf')
 
     def translate_pdf(self, input_path, config, task_id=None):
+        output_folder = _job_output.get()
         # TODO: 如果翻译失败了, 自动执行跳过字体子集化, 并且显示生成的文件的大小
-        config.update_config_file(config_path[pdf2zh])
+        task_config = self._task_config(input_path, config, pdf2zh)
         if config.targetLang == 'zh-CN': # TOFIX, pdf2zh 1.x converter没有通过
             config.targetLang = 'zh'
         if config.sourceLang == 'zh-CN': # TOFIX, pdf2zh 1.x converter没有通过
@@ -1028,7 +1101,7 @@ class PDFTranslator:
             '--service', str(config.service),
             '--lang-in', str(config.sourceLang),
             '--lang-out', str(config.targetLang),
-            '--config', str(config_path[pdf2zh]), # 使用默认的config path路径
+            '--config', task_config,
         ]
 
         if config.skip_last_pages and config.skip_last_pages > 0:
@@ -1063,10 +1136,18 @@ class PDFTranslator:
             print(f"🐲 pdf2zh 翻译成功, 生成文件: {f}, 大小为: {size/1024.0/1024.0:.2f} MB")
         return output_files
 
+    def _task_config(self, input_path, config, engine):
+        destination = os.path.join(os.path.dirname(input_path), 'config' + ('.toml' if engine == pdf2zh_next else '.json'))
+        shutil.copyfile(config_path[engine], destination)
+        os.chmod(destination, 0o600)
+        config.update_config_file(destination)
+        return destination
+
     def translate_pdf_next(self, input_path, config, task_id=None):
+        output_folder = _job_output.get()
         if config.service in pdf2zh_next_service_aliases:
             config.service = pdf2zh_next_service_aliases[config.service]
-        config.update_config_file(config_path[pdf2zh_next])
+        task_config = self._task_config(input_path, config, pdf2zh_next)
 
         cmd = [
             pdf2zh_next,
@@ -1076,7 +1157,7 @@ class PDFTranslator:
             '--output', str(output_folder),
             '--lang-in', str(config.sourceLang),
             '--lang-out', str(config.targetLang),
-            '--config-file', str(config_path[pdf2zh_next]), # 使用默认的config path路径
+            '--config-file', task_config,
         ]
         # TODO: 增加术语表的地址
         if config.no_watermark:
@@ -1241,6 +1322,12 @@ class PDFTranslator:
 
 def prepare_path():
     os.makedirs(output_folder, exist_ok=True)
+    os.makedirs(config_folder, exist_ok=True)
+    if data_path != root_path:
+        for path in config_path.values():
+            example = path + '.example'
+            if not os.path.exists(example):
+                shutil.copyfile(os.path.join(root_path, 'config', os.path.basename(example)), example)
     # Never overwrite an existing user config with the .example template.
     # Migration only adds missing defaults; user/custom values always win.
     prepare_config_files(config_path)
@@ -1321,7 +1408,7 @@ if __name__ == '__main__':
     ]
 
     for dir_name, description in required_dirs:
-        dir_path = os.path.join(root_path, dir_name)
+        dir_path = os.path.join(data_path, dir_name)
         if not os.path.exists(dir_path):
             print(f"⚠️  {description} ({dir_name}) 不存在，尝试创建...")
             try:
